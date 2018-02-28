@@ -15,13 +15,16 @@
  */
 package org.reaktivity.nukleus.tls.internal.stream;
 
+import java.util.function.Function;
 import java.util.function.IntUnaryOperator;
+import java.util.function.LongConsumer;
 import java.util.function.LongFunction;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
 import javax.net.ssl.SSLContext;
 
+import org.agrona.DirectBuffer;
 import org.agrona.MutableDirectBuffer;
 import org.agrona.collections.Long2ObjectHashMap;
 import org.reaktivity.nukleus.buffer.BufferPool;
@@ -29,6 +32,8 @@ import org.reaktivity.nukleus.route.RouteManager;
 import org.reaktivity.nukleus.stream.StreamFactory;
 import org.reaktivity.nukleus.stream.StreamFactoryBuilder;
 import org.reaktivity.nukleus.tls.internal.TlsConfiguration;
+import org.reaktivity.nukleus.tls.internal.types.control.RouteFW;
+import org.reaktivity.nukleus.tls.internal.types.control.UnrouteFW;
 
 public final class ClientStreamFactoryBuilder implements StreamFactoryBuilder
 {
@@ -36,11 +41,25 @@ public final class ClientStreamFactoryBuilder implements StreamFactoryBuilder
     private final SSLContext context;
     private final Long2ObjectHashMap<ClientStreamFactory.ClientHandshake> correlations;
 
+    private final UnrouteFW unrouteRO = new UnrouteFW();
+
+    private final Long2ObjectHashMap<LongSupplier> framesWrittenByteRouteId;
+    private final Long2ObjectHashMap<LongSupplier> framesReadByteRouteId;
+    private final Long2ObjectHashMap<LongConsumer> bytesWrittenByteRouteId;
+    private final Long2ObjectHashMap<LongConsumer> bytesReadByteRouteId;
+
     private RouteManager router;
     private MutableDirectBuffer writeBuffer;
     private LongSupplier supplyStreamId;
     private LongSupplier supplyCorrelationId;
     private Supplier<BufferPool> supplyBufferPool;
+    private Function<String, LongSupplier> supplyCounter;
+    private Function<String, LongConsumer> supplyAccumulator;
+
+    private Function<RouteFW, LongSupplier> supplyWriteFrameCounter;
+    private Function<RouteFW, LongSupplier> supplyReadFrameCounter;
+    private Function<RouteFW, LongConsumer> supplyWriteBytesAccumulator;
+    private Function<RouteFW, LongConsumer> supplyReadBytesAccumulator;
 
     public ClientStreamFactoryBuilder(
         TlsConfiguration config,
@@ -49,6 +68,11 @@ public final class ClientStreamFactoryBuilder implements StreamFactoryBuilder
         this.config = config;
         this.context = context;
         this.correlations = new Long2ObjectHashMap<>();
+
+        this.framesWrittenByteRouteId = new Long2ObjectHashMap<>();
+        this.framesReadByteRouteId = new Long2ObjectHashMap<>();
+        this.bytesWrittenByteRouteId = new Long2ObjectHashMap<>();
+        this.bytesReadByteRouteId = new Long2ObjectHashMap<>();
     }
 
     @Override
@@ -104,11 +128,92 @@ public final class ClientStreamFactoryBuilder implements StreamFactoryBuilder
     }
 
     @Override
+    public StreamFactoryBuilder setCounterSupplier(
+        Function<String, LongSupplier> supplyCounter)
+    {
+        this.supplyCounter = supplyCounter;
+        return this;
+    }
+
+    @Override
+    public StreamFactoryBuilder setAccumulatorSupplier(
+            Function<String, LongConsumer> supplyAccumulator)
+    {
+        this.supplyAccumulator = supplyAccumulator;
+        return this;
+    }
+
+    public boolean handleRoute(int msgTypeId, DirectBuffer buffer, int index, int length)
+    {
+        switch(msgTypeId)
+        {
+            case UnrouteFW.TYPE_ID:
+            {
+                final UnrouteFW unroute = unrouteRO.wrap(buffer, index, index + length);
+                final long routeId = unroute.correlationId();
+                bytesWrittenByteRouteId.remove(routeId);
+                bytesReadByteRouteId.remove(routeId);
+                framesWrittenByteRouteId.remove(routeId);
+                framesReadByteRouteId.remove(routeId);
+            }
+            break;
+        }
+        return true;
+    }
+
+    @Override
     public StreamFactory build()
     {
         final BufferPool bufferPool = supplyBufferPool.get();
 
-        return new ClientStreamFactory(config, context, router, writeBuffer,
-                bufferPool, supplyStreamId, supplyCorrelationId, correlations);
+        if (supplyWriteFrameCounter == null)
+        {
+            this.supplyWriteFrameCounter = r ->
+            {
+                final long routeId = r.correlationId();
+                return framesWrittenByteRouteId.computeIfAbsent(
+                        routeId,
+                        t -> supplyCounter.apply(String.format("%d.frames.written", t)));
+            };
+            this.supplyReadFrameCounter = r ->
+            {
+                final long routeId = r.correlationId();
+                return framesReadByteRouteId.computeIfAbsent(
+                        routeId,
+                        t -> supplyCounter.apply(String.format("%d.frames.read", t)));
+            };
+        }
+
+        if (supplyWriteBytesAccumulator == null)
+        {
+            this.supplyWriteBytesAccumulator = r ->
+            {
+                final long routeId = r.correlationId();
+                return bytesWrittenByteRouteId.computeIfAbsent(
+                        routeId,
+                        t -> supplyAccumulator.apply(String.format("%d.bytes.written", t)));
+            };
+            this.supplyReadBytesAccumulator = r ->
+            {
+                final long routeId = r.correlationId();
+                return bytesReadByteRouteId.computeIfAbsent(
+                        routeId,
+                        t -> supplyAccumulator.apply(String.format("%d.bytes.read", t)));
+            };
+        }
+
+        return new ClientStreamFactory(
+            config,
+            context,
+            router,
+            writeBuffer,
+            bufferPool,
+            supplyStreamId,
+            supplyCorrelationId,
+            correlations,
+            supplyReadFrameCounter,
+            supplyReadBytesAccumulator,
+            supplyWriteFrameCounter,
+            supplyWriteBytesAccumulator);
     }
 }

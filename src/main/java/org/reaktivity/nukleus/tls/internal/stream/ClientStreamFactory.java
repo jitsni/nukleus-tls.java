@@ -26,8 +26,10 @@ import java.nio.ByteBuffer;
 import java.util.Objects;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.IntConsumer;
 import java.util.function.IntSupplier;
+import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
 
 import javax.net.ssl.SNIHostName;
@@ -108,6 +110,11 @@ public final class ClientStreamFactory implements StreamFactory
     private final DirectBuffer outNetBuffer;
     private long networkGroupId;
 
+    private final Function<RouteFW, LongSupplier> supplyWriteFrameCounter;
+    private final Function<RouteFW, LongSupplier> supplyReadFrameCounter;
+    private final Function<RouteFW, LongConsumer> supplyWriteBytesAccumulator;
+    private final Function<RouteFW, LongConsumer> supplyReadBytesAccumulator;
+
     public ClientStreamFactory(
         TlsConfiguration config,
         SSLContext context,
@@ -116,7 +123,11 @@ public final class ClientStreamFactory implements StreamFactory
         BufferPool bufferPool,
         LongSupplier supplyStreamId,
         LongSupplier supplyCorrelationId,
-        Long2ObjectHashMap<ClientHandshake> correlations)
+        Long2ObjectHashMap<ClientHandshake> correlations,
+        Function<RouteFW, LongSupplier> supplyReadFrameCounter,
+        Function<RouteFW, LongConsumer> supplyReadBytesAccumulator,
+        Function<RouteFW, LongSupplier> supplyWriteFrameCounter,
+        Function<RouteFW, LongConsumer> supplyWriteBytesAccumulator)
     {
         this.context = requireNonNull(context);
         this.router = requireNonNull(router);
@@ -132,6 +143,11 @@ public final class ClientStreamFactory implements StreamFactory
         this.outAppByteBuffer = allocateDirect(writeBuffer.capacity());
         this.outNetByteBuffer = allocateDirect(Math.min(writeBuffer.capacity(), MAXIMUM_PAYLOAD_LENGTH));
         this.outNetBuffer = new UnsafeBuffer(outNetByteBuffer);
+
+        this.supplyWriteFrameCounter = supplyWriteFrameCounter;
+        this.supplyReadFrameCounter = supplyReadFrameCounter;
+        this.supplyWriteBytesAccumulator = supplyWriteBytesAccumulator;
+        this.supplyReadBytesAccumulator = supplyReadBytesAccumulator;
     }
 
     @Override
@@ -225,8 +241,25 @@ public final class ClientStreamFactory implements StreamFactory
 
             final long applicationId = begin.streamId();
 
-            newStream = new ClientAcceptStream(tlsHostname, tlsApplicationProtocol, defaultRoute, applicationThrottle,
-                    applicationId, authorization, networkName, networkRef)::handleStream;
+            final LongSupplier writeFrameCounter = supplyWriteFrameCounter.apply(route);
+            final LongSupplier readFrameCounter = supplyReadFrameCounter.apply(route);
+            final LongConsumer writeBytesAccumulator = supplyWriteBytesAccumulator.apply(route);
+            final LongConsumer readBytesAccumulator = supplyReadBytesAccumulator.apply(route);
+
+            newStream = new ClientAcceptStream(
+                tlsHostname,
+                tlsApplicationProtocol,
+                defaultRoute,
+                applicationThrottle,
+                applicationId,
+                authorization,
+                networkName,
+                networkRef,
+                writeFrameCounter,
+                readFrameCounter,
+                writeBytesAccumulator,
+                readBytesAccumulator
+                )::handleStream;
         }
 
         return newStream;
@@ -265,6 +298,11 @@ public final class ClientStreamFactory implements StreamFactory
         private final MessageConsumer networkTarget;
         private final long networkRef;
 
+        private final LongSupplier writeFrameCounter;
+        private final LongSupplier readFrameCounter;
+        private final LongConsumer writeBytesAccumulator;
+        private final LongConsumer readBytesAccumulator;
+
         private SSLEngine tlsEngine;
         private MessageConsumer streamState;
 
@@ -284,7 +322,11 @@ public final class ClientStreamFactory implements StreamFactory
             long applicationId,
             long authorization,
             String networkName,
-            long networkRef)
+            long networkRef,
+            LongSupplier writeFrameCounter,
+            LongSupplier readFrameCounter,
+            LongConsumer writeBytesAccumulator,
+            LongConsumer readBytesAccumulator)
         {
             this.tlsHostname = tlsHostname;
             this.tlsApplicationProtocol = tlsApplicationProtocol;
@@ -295,6 +337,10 @@ public final class ClientStreamFactory implements StreamFactory
             this.networkName = networkName;
             this.networkTarget = router.supplyTarget(networkName);
             this.networkRef = networkRef;
+            this.writeFrameCounter = writeFrameCounter;
+            this.readFrameCounter = readFrameCounter;
+            this.writeBytesAccumulator = writeBytesAccumulator;
+            this.readBytesAccumulator = readBytesAccumulator;
             this.streamState = this::beforeBegin;
         }
 
@@ -386,7 +432,11 @@ public final class ClientStreamFactory implements StreamFactory
                         applicationThrottle, applicationId, this::handleNetworkReplyDone,
                         this::getNetworkBudget, this::getNetworkPadding,
                         this::setNetworkBudget, this::setNetworkPadding,
-                        this::sendApplicationWindow);
+                        this::sendApplicationWindow,
+                        writeFrameCounter,
+                        readFrameCounter,
+                        writeBytesAccumulator,
+                        readBytesAccumulator);
 
                 correlations.put(newCorrelationId, newHandshake);
 
@@ -417,7 +467,8 @@ public final class ClientStreamFactory implements StreamFactory
                 {
                     doReset(applicationThrottle, applicationId);
                     doCloseOutbound(tlsEngine, networkTarget, networkId, networkPadding,
-                            authorization, this::handleNetworkReplyDone);
+                            authorization, this::handleNetworkReplyDone,
+                            writeFrameCounter, writeBytesAccumulator);
                 }
                 else
                 {
@@ -439,7 +490,8 @@ public final class ClientStreamFactory implements StreamFactory
                         }
 
                         flushNetwork(tlsEngine, result.bytesProduced(), networkTarget, networkId, networkPadding,
-                                authorization, this::handleNetworkReplyDone);
+                                authorization, this::handleNetworkReplyDone,
+                                writeFrameCounter, writeBytesAccumulator);
                     }
                 }
             }
@@ -458,7 +510,8 @@ public final class ClientStreamFactory implements StreamFactory
             try
             {
                 doCloseOutbound(tlsEngine, networkTarget, networkId, networkPadding,
-                        authorization, this::handleNetworkReplyDone);
+                        authorization, this::handleNetworkReplyDone,
+                        writeFrameCounter, writeBytesAccumulator);
             }
             catch (SSLException ex)
             {
@@ -591,6 +644,10 @@ public final class ClientStreamFactory implements StreamFactory
         IntConsumer networkPaddingConsumer;
         Runnable sendApplicationWindow;
         private int networkReplyGroupId;
+        LongSupplier writeFrameCounter;
+        LongSupplier readFrameCounter;
+        LongConsumer writeBytesAccumulator;
+        LongConsumer readBytesAccumulator;
 
         private ClientHandshake(
             SSLEngine tlsEngine,
@@ -610,7 +667,11 @@ public final class ClientStreamFactory implements StreamFactory
             IntSupplier networkPaddingSupplier,
             IntConsumer networkBudgetConsumer,
             IntConsumer networkPaddingConsumer,
-            Runnable sendApplicationWindow)
+            Runnable sendApplicationWindow,
+            LongSupplier writeFrameCounter,
+            LongSupplier readFrameCounter,
+            LongConsumer writeBytesAccumulator,
+            LongConsumer readBytesAccumulator)
         {
             this.tlsEngine = tlsEngine;
             this.applicationProtocol = applicationProtocol;
@@ -632,6 +693,10 @@ public final class ClientStreamFactory implements StreamFactory
             this.networkBudgetConsumer = networkBudgetConsumer;
             this.networkPaddingConsumer = networkPaddingConsumer;
             this.sendApplicationWindow = sendApplicationWindow;
+            this.writeFrameCounter = writeFrameCounter;
+            this.readFrameCounter = readFrameCounter;
+            this.writeBytesAccumulator = writeBytesAccumulator;
+            this.readBytesAccumulator = readBytesAccumulator;
         }
 
         @Override
@@ -770,8 +835,13 @@ public final class ClientStreamFactory implements StreamFactory
         private void handleData(
             DataFW data)
         {
+            int dataLength = data.length();
+
+            readFrameCounter.getAsLong();
+            readBytesAccumulator.accept(dataLength);
+
             networkReplyBudgetConsumer.accept(
-                    networkReplyBudgetSupplier.getAsInt() - data.length() - data.padding());
+                    networkReplyBudgetSupplier.getAsInt() - dataLength - data.padding());
 
             if (networkReplySlot == NO_SLOT)
             {
@@ -784,7 +854,8 @@ public final class ClientStreamFactory implements StreamFactory
                 {
                     doReset(networkReplyThrottle, networkReplyId);
                     doCloseOutbound(tlsEngine, networkTarget, networkId, networkPaddingSupplier.getAsInt(),
-                            networkAuthorization, networkReplyDoneHandler);
+                            networkAuthorization, networkReplyDoneHandler,
+                            writeFrameCounter, writeBytesAccumulator);
                 }
                 else
                 {
@@ -824,7 +895,7 @@ public final class ClientStreamFactory implements StreamFactory
                         }
                     }
 
-                    int networkReplyBudgetCredit = data.length() + networkReplyPaddingSupplier.getAsInt();
+                    int networkReplyBudgetCredit = dataLength + networkReplyPaddingSupplier.getAsInt();
                     networkReplyBudgetConsumer.accept(
                             networkReplyBudgetSupplier.getAsInt() + networkReplyBudgetCredit);
                     doWindow(networkReplyThrottle, networkReplyId, networkReplyGroupId, networkReplyBudgetCredit,
@@ -853,7 +924,8 @@ public final class ClientStreamFactory implements StreamFactory
             try
             {
                 doCloseOutbound(tlsEngine, networkTarget, networkId, networkPaddingSupplier.getAsInt(),
-                        networkAuthorization, networkReplyDoneHandler);
+                        networkAuthorization, networkReplyDoneHandler,
+                        writeFrameCounter, writeBytesAccumulator);
             }
             catch (SSLException ex)
             {
@@ -920,6 +992,11 @@ public final class ClientStreamFactory implements StreamFactory
         private IntSupplier networkPaddingSupplier;
         private long networkReplyGroupId;
         private long applicationReplyGroupId;
+
+        private LongSupplier writeFrameCounter;
+        private LongSupplier readFrameCounter;
+        private LongConsumer writeBytesAccumulator;
+        private LongConsumer readBytesAccumulator;
 
         private ClientConnectReplyStream(
             MessageConsumer networkReplyThrottle,
@@ -1005,6 +1082,10 @@ public final class ClientStreamFactory implements StreamFactory
                 this.doBeginApplicationReply = handshake::doBeginApplicationReply;
                 this.streamState = handshake::afterBegin;
                 this.networkReplyDoneHandler = handshake.networkReplyDoneHandler;
+                this.writeFrameCounter = handshake.writeFrameCounter;
+                this.readFrameCounter = handshake.readFrameCounter;
+                this.writeBytesAccumulator = handshake.writeBytesAccumulator;
+                this.readBytesAccumulator = handshake.readBytesAccumulator;
 
                 networkReplyBudget += handshakeWindowBytes;
                 doWindow(networkReplyThrottle, networkReplyId, networkReplyBudget, networkReplyPadding, networkReplyGroupId);
@@ -1037,7 +1118,12 @@ public final class ClientStreamFactory implements StreamFactory
         private void handleData(
             DataFW data)
         {
-            networkReplyBudget -= data.length() + data.padding();
+            final int dataLength = data.length();
+
+            readFrameCounter.getAsLong();
+            readBytesAccumulator.accept(dataLength);
+
+            networkReplyBudget -= dataLength + data.padding();
 
             if (networkReplySlot == NO_SLOT)
             {
@@ -1228,8 +1314,16 @@ public final class ClientStreamFactory implements StreamFactory
                         outNetByteBuffer.rewind();
                         SSLEngineResult result = tlsEngine.wrap(EMPTY_BYTE_BUFFER, outNetByteBuffer);
                         resultHandler.accept(result);
-                        flushNetwork(tlsEngine, result.bytesProduced(), networkTarget, networkId,
-                                networkPaddingSupplier.getAsInt(), networkAuthorization, networkReplyDoneHandler);
+                        flushNetwork(
+                            tlsEngine,
+                            result.bytesProduced(),
+                            networkTarget,
+                            networkId,
+                            networkPaddingSupplier.getAsInt(),
+                            networkAuthorization,
+                            networkReplyDoneHandler,
+                            writeFrameCounter,
+                            writeBytesAccumulator);
                         status = result.getHandshakeStatus();
                     }
                     catch (SSLException ex)
@@ -1412,12 +1506,16 @@ System.out.printf("TLSC recv WINDOW(%d) applicationReplyGroupId=%d networkReplyG
         long networkId,
         int padding,
         long authorization,
-        Runnable networkReplyDoneHandler)
+        Runnable networkReplyDoneHandler,
+        LongSupplier writeFrameCounter,
+        LongConsumer writeBytesAccumulator)
     {
         if (bytesProduced > 0)
         {
             final OctetsFW outNetOctets = outNetOctetsRO.wrap(outNetBuffer, 0, bytesProduced);
             doData(networkTarget, networkId, networkGroupId, padding, authorization, outNetOctets);
+            writeFrameCounter.getAsLong();
+            writeBytesAccumulator.accept(bytesProduced);
         }
 
         if (tlsEngine.isOutboundDone())
@@ -1567,7 +1665,9 @@ System.out.printf("TLSC recv WINDOW(%d) applicationReplyGroupId=%d networkReplyG
         long networkId,
         int networkPadding,
         long authorization,
-        Runnable networkReplyDoneHandler) throws SSLException
+        Runnable networkReplyDoneHandler,
+        LongSupplier writeFrameCounter,
+        LongConsumer writeBytesAccumulator) throws SSLException
     {
         tlsEngine.closeOutbound();
         outNetByteBuffer.rewind();
@@ -1577,6 +1677,7 @@ System.out.printf("TLSC recv WINDOW(%d) applicationReplyGroupId=%d networkReplyG
             // networkWindowBudget -= result.bytesProduced() + networkWindowPadding;
         }
         flushNetwork(tlsEngine, result.bytesProduced(), networkTarget, networkId, networkPadding, authorization,
-                networkReplyDoneHandler);
+                networkReplyDoneHandler, writeFrameCounter, writeBytesAccumulator);
     }
+
 }
