@@ -24,6 +24,7 @@ import static javax.net.ssl.SSLEngineResult.Status.BUFFER_UNDERFLOW;
 import static org.agrona.LangUtil.rethrowUnchecked;
 import static org.reaktivity.nukleus.buffer.BufferPool.NO_SLOT;
 
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Objects;
@@ -35,6 +36,7 @@ import java.util.function.IntSupplier;
 import java.util.function.LongConsumer;
 import java.util.function.LongSupplier;
 
+import javax.crypto.SecretKey;
 import javax.net.ssl.ExtendedSSLSession;
 import javax.net.ssl.SNIHostName;
 import javax.net.ssl.SNIServerName;
@@ -43,7 +45,9 @@ import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLEngineResult;
 import javax.net.ssl.SSLEngineResult.HandshakeStatus;
 import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLSession;
 
+import org.agrona.BitUtil;
 import org.agrona.DirectBuffer;
 import org.agrona.MutableDirectBuffer;
 import org.agrona.collections.Long2ObjectHashMap;
@@ -1352,10 +1356,28 @@ public final class ServerStreamFactory implements StreamFactory
                 handshake.setNetworkThrottle(this::handleThrottle);
                 sendApplicationReplyWindow();
                 handshake.setNetworkReplyDoneHandler(this::handleNetworkReplyDone);
+                //printMasterKey();
             }
             else
             {
                 doReset(applicationReplyThrottle, applicationReplyId);
+            }
+        }
+
+        private void printMasterKey()
+        {
+            try
+            {
+                SSLSession session = tlsEngine.getSession();
+                Class<?> c = Class.forName("sun.security.ssl.SSLSessionImpl");
+                Field masterSecretField = c.getDeclaredField("masterSecret");
+                masterSecretField.setAccessible(true);
+                SecretKey k = (SecretKey) masterSecretField.get(session);
+                System.out.println("secret: " + BitUtil.toHex(k.getEncoded()).toLowerCase());
+            }
+            catch (Exception e)
+            {
+                e.printStackTrace();
             }
         }
 
