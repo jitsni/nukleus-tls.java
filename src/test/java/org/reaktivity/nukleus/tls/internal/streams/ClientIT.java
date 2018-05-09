@@ -64,6 +64,19 @@ public class ClientIT
 
     @Test
     @Specification({
+            "${route}/client/controller",
+            "${client}/client.auth/client",
+            "${server}/client.auth/server" })
+    @ScriptProperty({
+            "newServerAcceptRef ${newClientConnectRef}",
+            "serverAccept \"nukleus://target/streams/tls#source\"" })
+    public void shouldEstablishConnectionWithClientAuth() throws Exception
+    {
+        k3po.finish();
+    }
+
+    @Test
+    @Specification({
             "${route}/client.alpn/controller",
             "${client}/connection.established.with.alpn/client",
             "${server}/connection.established.with.alpn/server" })
